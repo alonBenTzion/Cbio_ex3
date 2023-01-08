@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 
 BASES_INDICES = {"A": 0, "C": 1, "G": 2, "T": 3}
-
+TRAIN_DATA_FILES = ["train_background.fa.gz", "train_cpg_island.fa.gz"]
 
 def get_initial_transitions():
     initial_transitions = pd.DataFrame(index=["A+", "C+", "G+", "T+", "A-", "C-", "G-", "T-"],
@@ -101,25 +101,35 @@ def fastaread_gz(fasta_name):
         yield header, seq
 
 
-def train(convergence_threshold, algorithm):
-    train_data_files = ["train_background.fa.gz", "train_cpg_island.fa.gz"]
-
-    seqs_0, lengths_0 = preprocess_data(train_data_files[0])
-    seqs_1, lengths_1 = preprocess_data(train_data_files[1])
+def train(model):
+    seqs_0, lengths_0 = preprocess_data(TRAIN_DATA_FILES[0])
+    seqs_1, lengths_1 = preprocess_data(TRAIN_DATA_FILES[1])
     train_seqs = np.concatenate([seqs_0, seqs_1])
     train_lengths = np.concatenate([lengths_0, lengths_1])
-
-    emission, transition, startprob = get_initial_data()
-
-    model = hmm.CategoricalHMM(n_components=len(transition.index), algorithm=algorithm, n_iter=120,
-                               tol=convergence_threshold, params="st",  init_params="")
-    model.emissionprob_ = emission
-    model.startprob_ = np.squeeze(startprob.values)
-    model.transmat_ = transition
 
     model.fit(train_seqs, train_lengths)
 
     return model
+
+
+def predict_fasta(model, fasta):
+    states = []
+    likelihoods = []
+    lengths = []
+
+    reader = fastaread_gz if is_gz_file(fasta) else fastaread
+    for _, seq in reader(fasta):
+        parsed_seq = np.array([[BASES_INDICES[c]] for c in seq])
+        seq_len = np.array([len(seq)])
+        ll, hidden_states = model.decode(parsed_seq, seq_len)
+        hidden_states = np.where(hidden_states >= 4, 'N', 'I')
+        states.append(hidden_states)
+        likelihoods.append(ll)
+        lengths.append(len(seq))
+
+    states = [''.join(s.astype(str)) for s in states]
+
+    return states, likelihoods, lengths
 
 def parse_args():
     """
@@ -136,28 +146,76 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def display_model_parameters(model: hmm.CategoricalHMM, label: str):
+    transitions = pd.DataFrame(index=["A+", "C+", "G+", "T+", "A-", "C-", "G-", "T-"],
+                                       columns=["A+", "C+", "G+", "T+", "A-", "C-", "G-", "T-"],
+                                       data=model.transmat_)
+    emission = pd.DataFrame(index=["A+", "C+", "G+", "T+", "A-", "C-", "G-", "T-"],
+                                       columns=["A", "C", "G", "T"],
+                                       data=model.emissionprob_)
+    startprob = pd.DataFrame(index=["A+", "C+", "G+", "T+", "A-", "C-", "G-", "T-"],
+                                       columns=["p"],
+                                       data=model.startprob_)
+    
+    for mat, mat_name in zip((transitions, emission, startprob),("transition", "emission", "startprob")):
+        mat.to_html(f"{label}_{mat_name}.html")
+
+
+def init_model(algorithm, convergence_threshold):
+    model = hmm.CategoricalHMM(n_components=8, algorithm=algorithm, n_iter=120,
+                               tol=convergence_threshold, params="st",  init_params="")
+    emission, transition, startprob = get_initial_data()
+
+    model.emissionprob_ = emission
+    model.startprob_ = np.squeeze(startprob.values)
+    model.transmat_ = transition
+
+    return model
+
+
+def evaluate_model(model):
+    test_seqs = ["30_cpg_island.padded.fa.gz", "70_non_cpg_island.padded.fa.gz"]
+    test_labels = ["30_cpg_island.label.fa.gz", "70_non_cpg_island.label.fa.gz"]
+
+    # Question 2 - calculate average likelihood per base
+    for ts in test_seqs:
+        _, likelihoods, lengths = predict_fasta(model, ts)
+        likelihoods = np.array(likelihoods)
+        lengths = np.array(lengths)
+        likelihood_per_base = np.exp(likelihoods / lengths)
+        print(f"Average likelihood per base for {ts}: {np.mean(likelihood_per_base)}")
+
+    # Question 3 - evaluate model preformance
+
+
+def main(visualize: bool):
     args = parse_args()
     prediction_output_file = args.outputPrefix + "cpg_island_predictions.txt"
     likelihood_output_file = args.outputPrefix + "likelihood.txt"
     learned_params_output_file = args.outputPrefix + "params.txt"
-    model = train(args.convergenceThr, args.decodeAlg)
 
-    states = []
-    likelihoods = []
+    model = init_model(args.decodeAlg, args.convergenceThr)
 
-    reader = fastaread_gz if is_gz_file(args.fasta) else fastaread
-    for _, seq in reader(args.fasta):
-        parsed_seq = np.array([[BASES_INDICES[c]] for c in seq])
-        seq_len = np.array([len(seq)])
-        ll, hidden_states = model.decode(parsed_seq, seq_len)
-        hidden_states = np.where(hidden_states >= 4, 'N', 'I')
-        states.append(hidden_states)
-        likelihoods.append(ll)
+    if visualize:
+        display_model_parameters(model, "Before")
+        for tdf in TRAIN_DATA_FILES:
+            _, likelihoods_before, _ = predict_fasta(model, tdf)
+            print(f"Average log-likelihood before training for {tdf}: {np.mean(likelihoods_before)}")
+    
+    model = train(model)
+
+    if visualize:
+        display_model_parameters(model, "After")
+        for tdf in TRAIN_DATA_FILES:
+            _, likelihoods_after, _ = predict_fasta(model, tdf)
+            print(f"Average log-likelihood after training for {tdf}: {np.mean(likelihoods_after)}")
+        evaluate_model(model)
+    
+    states, likelihoods, _ = predict_fasta(model, args.fasta)
 
     with open(prediction_output_file, 'w') as outfile:
         for s in states:
-            outfile.write(f"{''.join(s.astype(str))}\n")
+            outfile.write(f"{s}\n")
 
     with open(likelihood_output_file, 'w') as outfile:
         for ll in likelihoods:
@@ -170,4 +228,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main(True)
